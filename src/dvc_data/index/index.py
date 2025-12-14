@@ -163,9 +163,9 @@ class Storage(ABC):
         self,
         entries: list["DataIndexEntry"],
         refresh: bool = False,
-        max_workers: int | None = None,
+        max_workers: Optional[int] = None,
         callback: "Callback" = DEFAULT_CALLBACK,
-        cached_info: dict[str, Any] | None = None,
+        cached_info: Optional[dict[str, Any]] = None,
     ) -> dict["DataIndexEntry", bool]:
         results = {}
         for entry in callback.wrap(entries):
@@ -241,39 +241,43 @@ class ObjectStorage(Storage):
         finally:
             self.index.commit()
 
+    def _bulk_exists_from_cache(
+        self,
+        entries_with_hash: list["DataIndexEntry"],
+        callback: "Callback",
+    ) -> dict["DataIndexEntry", bool]:
+        results = {}
+        for entry in callback.wrap(entries_with_hash):
+            assert entry.hash_info
+            value = cast("str", entry.hash_info.value)
+            if self.index is None:
+                exists = self.odb.exists(value)
+            else:
+                key = self.odb._oid_parts(value)
+                exists = key in self.index
+            results[entry] = exists
+
+        return results
+
     def bulk_exists(
         self,
         entries: list["DataIndexEntry"],
         refresh: bool = False,
-        max_workers: int | None = None,
+        max_workers: Optional[int] = None,
         callback: "Callback" = DEFAULT_CALLBACK,
-        cached_info: dict[str, Any] | None = None,
+        cached_info: Optional[dict[str, Any]] = None,
     ) -> dict["DataIndexEntry", bool]:
-        results = {}
-
         if not entries:
-            return results
+            return {}
 
         entries_with_hash = [e for e in entries if e.hash_info]
         entries_without_hash = [e for e in entries if not e.hash_info]
 
-        for entry in callback.wrap(entries_without_hash):
-            results[entry] = False
-
-        if self.index is None:
-            for entry in callback.wrap(entries_with_hash):
-                assert entry.hash_info
-                value = cast("str", entry.hash_info.value)
-                results[entry] = self.odb.exists(value)
-            return results
-
-        if not refresh:
-            for entry in callback.wrap(entries_with_hash):
-                assert entry.hash_info
-                value = cast("str", entry.hash_info.value)
-                key = self.odb._oid_parts(value)
-                results[entry] = key in self.index
-            return results
+        if self.index is None or not refresh:
+            return {
+                **dict.fromkeys(callback.wrap(entries_without_hash), False),
+                **self._bulk_exists_from_cache(entries_with_hash, callback),
+            }
 
         entry_map: dict[str, DataIndexEntry] = {
             self.get(entry)[1]: entry for entry in entries_with_hash
@@ -300,14 +304,15 @@ class ObjectStorage(Storage):
             if isinstance(info, FileNotFoundError) or info is None:
                 self.index.pop(key, None)
                 results[entry] = False
-            elif isinstance(info, Exception):
+                continue
+            if isinstance(info, Exception):
                 raise info
-            else:
-                from .build import build_entry
 
-                built_entry = build_entry(path, self.fs, info=info)
-                self.index[key] = built_entry
-                results[entry] = True
+            from .build import build_entry
+
+            built_entry = build_entry(path, self.fs, info=info)
+            self.index[key] = built_entry
+            results[entry] = True
 
         if self.index is not None:
             self.index.commit()
@@ -550,7 +555,7 @@ class StorageMapping(MutableMapping):
         # Unify batches per actual underlying ODB path.
         # Maps from (storage_type, odb_path) to [(StorageInstance, entries)]
         odb_batches: dict[
-            tuple[type, str | None], list[tuple[ObjectStorage, list[DataIndexEntry]]]
+            tuple[type, Optional[str]], list[tuple[ObjectStorage, list[DataIndexEntry]]]
         ] = defaultdict(list)
 
         for storage, storage_entries in by_storage.items():
