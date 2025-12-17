@@ -163,9 +163,8 @@ class Storage(ABC):
         self,
         entries: list["DataIndexEntry"],
         refresh: bool = False,
-        max_workers: Optional[int] = None,
+        jobs: Optional[int] = None,
         callback: "Callback" = DEFAULT_CALLBACK,
-        cached_info: Optional[dict[str, Any]] = None,
     ) -> dict["DataIndexEntry", bool]:
         results = {}
         for entry in callback.wrap(entries):
@@ -241,61 +240,42 @@ class ObjectStorage(Storage):
         finally:
             self.index.commit()
 
-    def _bulk_exists_from_cache(
-        self,
-        entries_with_hash: list["DataIndexEntry"],
-        callback: "Callback",
-    ) -> dict["DataIndexEntry", bool]:
-        results = {}
-        for entry in callback.wrap(entries_with_hash):
-            assert entry.hash_info
-            value = cast("str", entry.hash_info.value)
-            if self.index is None:
-                exists = self.odb.exists(value)
-            else:
-                key = self.odb._oid_parts(value)
-                exists = key in self.index
-            results[entry] = exists
-
-        return results
-
     def bulk_exists(
         self,
         entries: list["DataIndexEntry"],
         refresh: bool = False,
-        max_workers: Optional[int] = None,
+        jobs: Optional[int] = None,
         callback: "Callback" = DEFAULT_CALLBACK,
-        cached_info: Optional[dict[str, Any]] = None,
     ) -> dict["DataIndexEntry", bool]:
         if not entries:
             return {}
 
         entries_with_hash = [e for e in entries if e.hash_info]
         entries_without_hash = [e for e in entries if not e.hash_info]
+        results = dict.fromkeys(callback.wrap(entries_without_hash), False)
 
         if self.index is None or not refresh:
-            return {
-                **dict.fromkeys(callback.wrap(entries_without_hash), False),
-                **self._bulk_exists_from_cache(entries_with_hash, callback),
-            }
+            for entry in callback.wrap(entries_with_hash):
+                assert entry.hash_info
+                value = cast("str", entry.hash_info.value)
+                if self.index is None:
+                    exists = self.odb.exists(value)
+                else:
+                    key = self.odb._oid_parts(value)
+                    exists = key in self.index
+                results[entry] = exists
+            return results
 
         entry_map: dict[str, DataIndexEntry] = {
             self.get(entry)[1]: entry for entry in entries_with_hash
         }
-        if cached_info is not None:
-            # Instead of doing the network call, we use the pre-computed info.
-            info_results = [
-                cached_info.get(path) for path in callback.wrap(entry_map.keys())
-            ]
-        else:
-            info_results = self.fs.info(
-                list(entry_map.keys()),
-                batch_size=max_workers,
-                return_exceptions=True,
-                callback=callback,
-            )
+        info_results = self.fs.info(
+            list(entry_map.keys()),
+            batch_size=jobs,
+            return_exceptions=True,
+            callback=callback,
+        )
 
-        results = {}
         for (path, entry), info in zip(entry_map.items(), info_results):
             assert entry.hash_info  # built from entries_with_hash
             value = cast("str", entry.hash_info.value)
@@ -540,70 +520,37 @@ class StorageMapping(MutableMapping):
     def _bulk_storage_exists(
         self,
         entries: list[DataIndexEntry],
-        storage_selector: Callable[["StorageInfo"], Optional["Storage"]],
-        callback: Callback = DEFAULT_CALLBACK,
+        storage_attr: str = "cache",  # TODO: proper name
         **kwargs,
     ) -> dict[DataIndexEntry, bool]:
-        by_storage: dict[Optional[Storage], list[DataIndexEntry]] = defaultdict(list)
+        by_storage: dict[Storage, list[DataIndexEntry]] = defaultdict(list)
+        by_odb: dict[Optional[HashFileDB], dict[Storage, list[DataIndexEntry]]] = (
+            defaultdict(lambda: defaultdict(list))
+        )
         for entry in entries:
             storage_info = self[entry.key]
-            storage = storage_selector(storage_info) if storage_info else None
-            by_storage[storage].append(entry)
+            storage = getattr(storage_info, storage_attr) if storage_info else None
+            if isinstance(storage, ObjectStorage):
+                by_odb[storage.odb][storage].append(entry)
+            elif storage is not None:
+                by_storage[storage].append(entry)
+
+        for storages in by_odb.values():
+            assert storages  # cannot be empty, we always add at least one entry
+            rep = next(iter(storages))
+            by_storage[rep] = [e for entries in storages.values() for e in entries]
 
         results = {}
 
-        # Unify batches per actual underlying ODB path.
-        # Maps from (storage_type, odb_path) to [(StorageInstance, entries)]
-        odb_batches: dict[
-            tuple[type, Optional[str]], list[tuple[ObjectStorage, list[DataIndexEntry]]]
-        ] = defaultdict(list)
-
-        for storage, storage_entries in by_storage.items():
-            if storage is None:
-                for entry in storage_entries:
-                    raise StorageKeyError(entry.key)
-                continue
-
-            if not isinstance(storage, ObjectStorage):
-                # We won't optimize this and run it normally.
-                storage_results = storage.bulk_exists(
-                    storage_entries, callback=callback, **kwargs
-                )
-                results.update(storage_results)
-                continue
-
-            key = (type(storage), storage.path)
-            odb_batches[key].append((storage, storage_entries))
-
         # Actually process batches
-        for storage_groups in odb_batches.values():
-            all_paths = [
-                storage.get(entry)[1]
-                for storage, entries in storage_groups
-                for entry in entries
-            ]
-
-            # Any storage is representative for this batch
-            batch_info = storage_groups[0][0].fs.info(
-                all_paths,
-                return_exceptions=True,
-                callback=callback,
-            )
-
-            # Maps from path to info
-            cached_info: dict[str, Any] = {
-                p: info if not isinstance(info, Exception) else None
-                for p, info in zip(all_paths, batch_info)
-            }
-
+        for storage, storage_entries in by_storage.items():
             # Finally, distribute results back to original storages
-            for storage, storage_entries in storage_groups:
-                storage_results = storage.bulk_exists(
+            results.update(
+                storage.bulk_exists(
                     storage_entries,
-                    cached_info=cached_info,
                     **kwargs,
                 )
-                results.update(storage_results)
+            )
 
         return results
 
@@ -615,7 +562,7 @@ class StorageMapping(MutableMapping):
     ) -> dict[DataIndexEntry, bool]:
         return self._bulk_storage_exists(
             entries,
-            lambda info: info.cache,
+            "cache",
             callback=callback,
             **kwargs,
         )
@@ -628,7 +575,7 @@ class StorageMapping(MutableMapping):
     ) -> dict[DataIndexEntry, bool]:
         return self._bulk_storage_exists(
             entries,
-            lambda info: info.remote,
+            "remote",
             callback=callback,
             **kwargs,
         )
