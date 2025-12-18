@@ -252,7 +252,8 @@ class ObjectStorage(Storage):
 
         entries_with_hash = [e for e in entries if e.hash_info]
         entries_without_hash = [e for e in entries if not e.hash_info]
-        results = dict.fromkeys(callback.wrap(entries_without_hash), False)
+        results = dict.fromkeys(entries_without_hash, False)
+        callback.relative_update(len(entries_without_hash))
 
         if self.index is None or not refresh:
             for entry in callback.wrap(entries_with_hash):
